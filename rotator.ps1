@@ -3,14 +3,14 @@
  rotator.ps1 - the background loop that changes your public IP.
 
  start.bat launches this hidden; you normally never run it yourself.
- Right after starting, and then every IntervalSeconds, it:
-   1. disconnects the current Proton server (the free plan allows only one
-      connection at a time),
-   2. connects to a different, randomly chosen server through OpenVPN GUI,
-   3. checks with api.ipify.org that your public IP really changed,
-   4. tries the next server if not. If every server fails, it leaves you on
-      your normal internet and tries again at the next interval,
-   5. writes the change to rotator.log.
+ It:
+   1. notes your normal IP,
+   2. starts Tor (hidden) and waits until it's connected,
+   3. points Windows' proxy settings at Tor, so your browser's traffic
+      leaves the internet from a Tor exit with a different IP,
+   4. every IntervalSeconds asks Tor for a new route (= a new IP), checks
+      the IP really changed (api.ipify.org) and logs it to rotator.log,
+   5. when stopped, puts your proxy settings back and closes Tor.
  It runs until stop.bat ends it, or until AutoStopHours have passed.
 =============================================================================
 #>
@@ -50,15 +50,16 @@ $startTime = Get-Date
 $stopAt = if ($AutoStopHours -gt 0) { $startTime.AddHours($AutoStopHours) } else { $null }
 $state = [ordered]@{
     pid             = $PID
-    status          = 'starting'      # starting / switching / connected / not connected / stopped
+    status          = 'starting'      # starting / connecting / running / changing / stopped
     message         = ''
     intervalSeconds = $IntervalSeconds
     autoStopHours   = $AutoStopHours
     startedAt       = $startTime.ToString('o')
     stopAt          = if ($stopAt) { $stopAt.ToString('o') } else { $null }
-    homeIp          = $null           # your normal IP, measured before the first switch
-    currentServer   = $null           # e.g. nl-free-12.protonvpn.udp (null = normal internet)
+    homeIp          = $null           # your normal IP, measured before Tor starts
     currentIp       = $null
+    country         = $null           # country of the current Tor exit
+    torPid          = $null
     lastRotation    = $null
     nextRotation    = $null
     updatedAt       = $null
@@ -68,103 +69,67 @@ function Save-State {
     Write-JsonFile -Path $STATE_PATH -Data $state
 }
 
-function Get-ServerName {
-    # "iprot-nl-free-12.protonvpn.udp" -> "nl-free-12.protonvpn.udp"
-    param([string]$ConfigName)
-    return $ConfigName.Substring($CONFIG_NAME_PREFIX.Length)
-}
-
-function Invoke-Rotation {
-    # One IP change. Uses $gui and $configNames from the main part below.
-    $oldIp = Get-PublicIp
-    if (-not $oldIp) { $oldIp = $state.currentIp }
-    $current = if ($state.currentServer) { $CONFIG_NAME_PREFIX + $state.currentServer } else { $null }
-
-    # Every config except the one we're on now, in random order.
-    $candidates = @($configNames | Where-Object { $_ -ne $current } | Sort-Object { Get-Random })
-
-    # Proton Free allows one connection at a time, so disconnect first.
-    if ($current) { Disconnect-Vpn -GuiPath $gui -Name $current }
-
-    $authFailures = 0
-    foreach ($name in $candidates) {
-        $server = Get-ServerName $name
-        $state.message = "Connecting to $server"
-        Save-State
-
-        $result = Connect-Vpn -GuiPath $gui -Name $name
-        if ($result -eq 'ok') {
-            $newIp = Get-PublicIp
-            if ($newIp -and $newIp -ne $oldIp -and $newIp -ne $state.homeIp) {
-                # Success!
-                Write-Log ('old IP {0} -> new IP {1} | server {2}' -f $oldIp, $newIp, $server) 'ROTATE'
-                $state.status        = 'connected'
-                $state.currentServer = $server
-                $state.currentIp     = $newIp
-                $state.lastRotation  = (Get-Date).ToString('o')
-                $state.message       = ''
-                return
-            }
-            Write-Log "$server connected, but the IP didn't change ($newIp). Trying another server." 'WARN'
+function Set-NewIp {
+    # One IP change. On the very first one Tor's routes are already new, so
+    # there's no need to ask for fresh ones.
+    param([switch]$First)
+    $oldIp = $state.currentIp
+    for ($try = 1; $try -le $NEW_IP_TRIES; $try++) {
+        if (-not $First -or $try -gt 1) { Request-NewTorIdentity }
+        $newIp = Get-PublicIp -Via Tor
+        if ($newIp -and $newIp -ne $oldIp -and $newIp -ne $state.homeIp) {
+            $country = Get-TorCountry $newIp
+            Write-Log ('old IP {0} -> new IP {1} | {2}' -f $oldIp, $newIp, $country) 'ROTATE'
+            $state.currentIp    = $newIp
+            $state.country      = $country
+            $state.lastRotation = (Get-Date).ToString('o')
+            $state.message      = ''
+            return
         }
-        elseif ($result -eq 'auth-failed') {
-            $authFailures++
-            Write-Log "$server rejected the login (AUTH_FAILED)." 'WARN'
-            if ($authFailures -ge 2) {
-                Write-Log 'Proton rejected the OpenVPN username/password twice. Run setup.bat to re-enter them (use the OpenVPN/IKEv2 credentials, not your Proton email login). The free plan also refuses logins while you are connected on another device.' 'ERROR'
-                Disconnect-Vpn -GuiPath $gui -Name $name
-                break
-            }
-        }
-        else {
-            Write-Log "$server did not connect ($result). Trying another server." 'WARN'
-        }
-        Disconnect-Vpn -GuiPath $gui -Name $name
+        if ($newIp) { Write-Log "Tor gave the same IP again ($newIp), asking for another (try $try of $NEW_IP_TRIES)." 'WARN' }
+        else        { Write-Log "Couldn't reach the internet through Tor (try $try of $NEW_IP_TRIES)." 'WARN' }
+        # Tor hands out a new route at most once every 10 seconds.
+        if ($try -lt $NEW_IP_TRIES) { Start-Sleep -Seconds 10 }
     }
-
-    # Nothing worked: make sure you're back on your normal internet.
-    Disconnect-AllRotatorVpns -GuiPath $gui
-    $state.status        = 'not connected'
-    $state.currentServer = $null
-    $state.currentIp     = Get-PublicIp
-    $state.message       = 'Every server failed last time; using your normal internet until the next try.'
-    Write-Log "Couldn't switch to any server; using your normal internet until the next try in $(Format-Duration $IntervalSeconds)." 'ERROR'
+    $state.message = "Couldn't get a new IP last time; trying again at the next change."
+    Write-Log "Couldn't get a new IP this time; trying again in $(Format-Duration $IntervalSeconds)." 'ERROR'
 }
 
 
 # =============================================================================
 #  Main part
 # =============================================================================
-$gui = $null
+$tor = $null
 try {
     Save-State
+    if (-not (Get-TorExe)) { throw 'Tor is missing. Run start.bat, which downloads it automatically.' }
 
-    # Is everything set up?
-    $problems = @(Get-SetupProblems)
-    if ($problems.Count -gt 0) {
-        foreach ($p in $problems) { Write-Log $p 'ERROR' }
-        $state.message = $problems -join ' '
-        exit 1
-    }
-    $gui = Find-OpenVpnGui
-
-    # Hand your UDP configs to OpenVPN GUI (TCP ones are skipped).
-    $configs = Get-SourceConfigs
-    foreach ($tcp in $configs.Tcp) { Write-Log "Skipping $($tcp.Name): it's a TCP config, only UDP ones are used." 'WARN' }
-    $configNames = @(Sync-VpnConfigs -Files $configs.Udp)
-    Start-OpenVpnGui -GuiPath $gui
-
-    # Start from a clean slate, then note your normal IP for later comparison.
-    Disconnect-AllRotatorVpns -GuiPath $gui
-    $state.homeIp    = Get-PublicIp
+    # Close a Tor left over from an earlier run, then note your normal IP.
+    Stop-Tor
+    $state.homeIp    = Get-PublicIp -Via Direct
     $state.currentIp = $state.homeIp
-    $autoStopText = if ($stopAt) { "after $AutoStopHours h (at $($stopAt.ToString('yyyy-MM-dd HH:mm')))" } else { 'off' }
-    Write-Log ("Started. Interval {0} s ({1}), auto-stop {2}, {3} UDP configs, normal IP {4}." -f `
-        $IntervalSeconds, (Format-Duration $IntervalSeconds), $autoStopText, $configNames.Count, $state.homeIp)
 
-    # The first switch happens right away; after that, every IntervalSeconds.
+    # Start Tor and wait until it's connected (usually 5-30 seconds).
+    $state.status  = 'connecting'
+    $state.message = 'Connecting to the Tor network'
+    Save-State
+    $tor = Start-Tor -OwnerPid $PID
+    $state.torPid = $tor.Id
+    if (-not (Wait-TorReady -TorProcess $tor -TimeoutSeconds $TOR_START_TIMEOUT_SECONDS)) {
+        throw "Tor couldn't connect within $TOR_START_TIMEOUT_SECONDS seconds. Your network may be blocking Tor."
+    }
+
+    # Send your browser's traffic through Tor.
+    Set-TorProxy
+    $autoStopText = if ($stopAt) { "after $AutoStopHours h (at $($stopAt.ToString('yyyy-MM-dd HH:mm')))" } else { 'off' }
+    Write-Log ("Started. Interval {0} s ({1}), auto-stop {2}, normal IP {3}." -f `
+        $IntervalSeconds, (Format-Duration $IntervalSeconds), $autoStopText, $state.homeIp)
+
+    # The first change happens right away; after that, every IntervalSeconds.
+    $first = $true
     $nextRotation = Get-Date
     while ($true) {
+        if ($tor.HasExited) { throw 'Tor stopped unexpectedly.' }
         if ($stopAt -and (Get-Date) -ge $stopAt) {
             Write-Log "Auto-stop: $AutoStopHours h have passed."
             $state.message = 'Stopped automatically (auto-stop time reached).'
@@ -172,16 +137,18 @@ try {
         }
         if ((Get-Date) -ge $nextRotation) {
             $rotationStart = Get-Date
-            $state.status = 'switching'
+            $state.status = 'changing'
             $state.nextRotation = $null
             Save-State
 
-            Invoke-Rotation
+            Set-NewIp -First:$first
+            $first = $false
 
-            # Count the interval from when this switch started. If the switch took
-            # longer than the interval (several servers failed), count from now.
+            # Count the interval from when this change started. If the change took
+            # longer than the interval, count from now.
             $nextRotation = $rotationStart.AddSeconds($IntervalSeconds)
             if ($nextRotation -le (Get-Date)) { $nextRotation = (Get-Date).AddSeconds($IntervalSeconds) }
+            $state.status = 'running'
             $state.nextRotation = $nextRotation.ToString('o')
             Save-State
         }
@@ -189,19 +156,22 @@ try {
     }
 }
 catch {
-    Write-Log "Stopped because of an unexpected problem: $($_.Exception.Message)" 'ERROR'
-    $state.message = "Stopped because of an unexpected problem: $($_.Exception.Message)"
+    Write-Log "Stopped because of a problem: $($_.Exception.Message)" 'ERROR'
+    $state.message = "Stopped because of a problem: $($_.Exception.Message)"
 }
 finally {
-    # However we got here, leave you on your normal internet.
-    if ($gui) { try { Disconnect-AllRotatorVpns -GuiPath $gui } catch { } }
-    $state.status        = 'stopped'
-    $state.currentServer = $null
-    $state.nextRotation  = $null
+    # However we got here, give you your normal internet back.
+    try { [void](Restore-ProxySettings) } catch { }
+    try { if ($tor -and -not $tor.HasExited) { Stop-Process -Id $tor.Id -Force } } catch { }
+    try { Stop-Tor } catch { }
+    $state.status       = 'stopped'
+    $state.currentIp    = $null
+    $state.country      = $null
+    $state.nextRotation = $null
     try { Save-State } catch { }
     # Remove the lock file, but only if it's still ours.
     $lockPid = Get-Content -Path $PID_PATH -Raw -ErrorAction SilentlyContinue
     if ($lockPid -and $lockPid.Trim() -eq "$PID") { Remove-Item -Path $PID_PATH -Force -ErrorAction SilentlyContinue }
-    Write-Log 'Rotator stopped.'
+    Write-Log 'Rotator stopped. Normal internet restored.'
     $mutex.ReleaseMutex()
 }

@@ -2,7 +2,7 @@
 =============================================================================
  make-shortcut.ps1 - creates Desktop shortcuts for start, stop and status,
  each with its own icon (built-in Windows icons, nothing downloaded).
- setup.bat runs this for you. To run it again yourself:
+ Optional - start.bat works fine without shortcuts. To create them:
      powershell -ExecutionPolicy Bypass -File make-shortcut.ps1
  To remove the shortcuts again:
      powershell -ExecutionPolicy Bypass -File make-shortcut.ps1 -Remove

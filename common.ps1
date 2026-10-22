@@ -3,12 +3,18 @@
 #  Every other script loads this file first. You don't run it directly.
 # =============================================================================
 
-# Load the settings (paths, minimum interval, timeouts).
+# Load the settings (paths, minimum interval, ports).
 . (Join-Path $PSScriptRoot 'config.ps1')
 
-# api.ipify.org needs TLS 1.2, which Windows PowerShell 5.1 doesn't always
-# switch on by itself.
+# The Tor Project's servers and api.ipify.org need TLS 1.2, which Windows
+# PowerShell 5.1 doesn't always switch on by itself.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+# Where Windows keeps your proxy settings (your user account only, no admin needed).
+$INTERNET_SETTINGS_KEY = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+$PROXY_VALUE_NAMES     = @('ProxyEnable', 'ProxyServer', 'ProxyOverride', 'AutoConfigURL')
+$RUNONCE_KEY           = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+$RUNONCE_NAME          = 'IPRotator-restore-proxy'
 
 
 # -----------------------------------------------------------------------------
@@ -17,7 +23,7 @@
 
 function Write-Log {
     # Adds one line to rotator.log, e.g.
-    #   2026-01-31 14:05:00 | ROTATE | old IP ... -> new IP ... | server ...
+    #   2026-01-31 14:05:00 | ROTATE | old IP ... -> new IP ... | Germany
     param([string]$Message, [string]$Level = 'INFO')
     try {
         # Keep the log small: when it gets too big, keep one old copy and start fresh.
@@ -85,192 +91,271 @@ function ConvertTo-DateTime {
 
 
 # -----------------------------------------------------------------------------
-#  OpenVPN GUI
+#  Tor: download, start, stop, and ask for a new IP
 # -----------------------------------------------------------------------------
 
-function Find-OpenVpnGui {
-    # Returns the full path of openvpn-gui.exe, or $null if it isn't installed.
-    if ($OPENVPN_GUI_PATH -and (Test-Path $OPENVPN_GUI_PATH)) { return $OPENVPN_GUI_PATH }
-    $candidates = @()
-    # The OpenVPN installer records its install folder in the registry.
-    foreach ($key in 'HKLM:\SOFTWARE\OpenVPN', 'HKLM:\SOFTWARE\WOW6432Node\OpenVPN') {
-        $dir = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).'(default)'
-        if ($dir) { $candidates += Join-Path $dir 'bin\openvpn-gui.exe' }
-    }
-    # Otherwise try the default install folders.
-    $candidates += Join-Path $env:ProgramFiles 'OpenVPN\bin\openvpn-gui.exe'
-    if (${env:ProgramFiles(x86)}) { $candidates += Join-Path ${env:ProgramFiles(x86)} 'OpenVPN\bin\openvpn-gui.exe' }
-    foreach ($path in $candidates) { if (Test-Path $path) { return $path } }
+function Get-TorExe {
+    # Full path of the downloaded tor.exe, or $null if it isn't downloaded yet.
+    if (-not (Test-Path $TOR_DIR)) { return $null }
+    $exe = Get-ChildItem -Path $TOR_DIR -Recurse -File -Filter 'tor.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($exe) { return $exe.FullName }
     return $null
 }
 
-function Get-OpenVpnGuiFolders {
-    # OpenVPN GUI reads configs from, and writes logs to, folders in your user
-    # profile. They can be changed in its Settings, so check the registry first.
-    $reg = Get-ItemProperty -Path 'HKCU:\Software\OpenVPN-GUI' -ErrorAction SilentlyContinue
-    $configDir = Join-Path $env:USERPROFILE 'OpenVPN\config'
-    $logDir    = Join-Path $env:USERPROFILE 'OpenVPN\log'
-    if ($reg -and $reg.config_dir) { $configDir = [Environment]::ExpandEnvironmentVariables($reg.config_dir) }
-    if ($reg -and $reg.log_dir)    { $logDir    = [Environment]::ExpandEnvironmentVariables($reg.log_dir) }
-    return [pscustomobject]@{ ConfigDir = $configDir; LogDir = $logDir }
-}
+function Install-Tor {
+    # Downloads the official "Tor Expert Bundle" (just the tor program, no
+    # browser) into the tor folder and checks it against the SHA-256 checksum
+    # the Tor Project publishes. Nothing is installed in Windows.
+    # Returns the Tor version.
+    $ProgressPreference = 'SilentlyContinue'   # PowerShell's progress bar makes downloads very slow
 
-function Get-SourceConfigs {
-    # Looks at the .ovpn files in configs\ and splits them into UDP (used) and
-    # TCP (skipped, because UDP is faster).
-    $udp = @(); $tcp = @()
-    foreach ($file in @(Get-ChildItem -Path $CONFIGS_DIR -Filter '*.ovpn' -File -ErrorAction SilentlyContinue)) {
-        $text = Get-Content -Path $file.FullName -Raw
-        if ($text -match '(?im)^\s*proto\s+tcp') { $tcp += $file } else { $udp += $file }
+    $version = "$((Invoke-RestMethod -Uri $TOR_VERSION_URL -UseBasicParsing -TimeoutSec 30).version)"
+    if ($version -notmatch '^[0-9.]+$') { throw "Couldn't find out the latest Tor version. Check your internet connection." }
+    $file = "tor-expert-bundle-windows-x86_64-$version.tar.gz"
+
+    $downloadDir = Join-Path $TOR_DIR 'download'
+    New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+    $archive = Join-Path $downloadDir $file
+    $sums    = Join-Path $downloadDir 'sha256sums.txt'
+
+    $downloaded = $false
+    foreach ($base in $TOR_DOWNLOAD_BASES) {
+        try {
+            Invoke-WebRequest -Uri "$base/$version/$file" -OutFile $archive -UseBasicParsing -TimeoutSec 600
+            Invoke-WebRequest -Uri "$base/$version/sha256sums-signed-build.txt" -OutFile $sums -UseBasicParsing -TimeoutSec 60
+            $downloaded = $true
+            break
+        } catch { }   # try the next official server
     }
-    return [pscustomobject]@{ Udp = $udp; Tcp = $tcp }
-}
+    if (-not $downloaded) { throw "Couldn't download Tor from torproject.org. Check your internet connection and run start.bat again." }
 
-function Sync-VpnConfigs {
-    # OpenVPN GUI only sees configs inside its own config folder, so this copies
-    # your .ovpn files into an "IPRotator" subfolder there. In each copy, Proton's
-    # "auth-user-pass" line (which makes OpenVPN GUI pop up a login box) is
-    # replaced by one that points at your saved credentials file.
-    # Your original files in configs\ are never changed.
-    # Returns the names OpenVPN GUI knows the copies by.
-    param([System.IO.FileInfo[]]$Files)
-
-    $dest = Join-Path (Get-OpenVpnGuiFolders).ConfigDir 'IPRotator'
-    New-Item -ItemType Directory -Path $dest -Force | Out-Null
-
-    # In OpenVPN config files, backslashes inside quotes must be doubled.
-    $authLine = 'auth-user-pass "' + $AUTH_FILE_PATH.Replace('\', '\\') + '"'
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-
-    $names = @()
-    $keep = @{}
-    foreach ($file in $Files) {
-        $name = $CONFIG_NAME_PREFIX + $file.BaseName
-        $lines = (Get-Content -Path $file.FullName -Raw) -split "`r?`n" |
-            Where-Object { $_ -notmatch '^\s*auth-user-pass\b' }
-        $newText = (@($lines) + $authLine) -join "`r`n"
-        $target = Join-Path $dest "$name.ovpn"
-        # Only rewrite the copy if something changed.
-        $oldText = if (Test-Path $target) { [IO.File]::ReadAllText($target) } else { $null }
-        if ($oldText -ne $newText) { [IO.File]::WriteAllText($target, $newText, $utf8NoBom) }
-        $keep["$name.ovpn"] = $true
-        $names += $name
+    # Make sure the file is exactly what the Tor Project published.
+    $line = Select-String -Path $sums -Pattern ([regex]::Escape($file)) | Select-Object -First 1
+    $expected = if ($line) { ($line.Line -split '\s+')[0] } else { '' }
+    $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash
+    if (-not $expected -or $actual -ne $expected) {
+        Remove-Item -Path $downloadDir -Recurse -Force
+        throw "The Tor download failed its checksum check, so it was deleted. Please run start.bat again."
     }
-    # Remove copies of configs you have since deleted from configs\.
-    Get-ChildItem -Path $dest -Filter "$CONFIG_NAME_PREFIX*.ovpn" -File |
-        Where-Object { -not $keep.ContainsKey($_.Name) } |
-        Remove-Item -Force
-    return $names
+
+    # Unpack it with the tar tool built into Windows 10 and 11.
+    & (Join-Path $env:SystemRoot 'System32\tar.exe') -xzf $archive -C $TOR_DIR
+    if ($LASTEXITCODE -ne 0) { throw "Couldn't unpack the Tor download." }
+    Remove-Item -Path $downloadDir -Recurse -Force
+    if (-not (Get-TorExe)) { throw "Tor was downloaded, but tor.exe wasn't found inside it." }
+    return $version
 }
 
-function Get-OpenVpnGuiProcess {
-    # Returns OpenVPN GUI if it's running in YOUR Windows session, else $null.
-    $mySession = (Get-Process -Id $PID).SessionId
-    return Get-Process -Name 'openvpn-gui' -ErrorAction SilentlyContinue |
-        Where-Object { $_.SessionId -eq $mySession } | Select-Object -First 1
+function Get-TorProcesses {
+    # Tor processes started from this project's tor folder (Tor Browser is left alone).
+    $folder = (Resolve-Path -Path $TOR_DIR -ErrorAction SilentlyContinue).Path
+    if (-not $folder) { return @() }
+    return @(Get-Process -Name 'tor' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($folder, [StringComparison]::OrdinalIgnoreCase) })
 }
 
-function Invoke-OpenVpnGui {
-    # Sends a command to the OpenVPN GUI that's already running in your tray,
-    # e.g. "--command connect <name>". OpenVPN GUI's own background service
-    # does the parts that need admin rights, so no admin prompt appears.
-    param([string]$GuiPath, [string[]]$Arguments)
-    # Start-Process doesn't add quotes itself, so quote each argument.
-    $argLine = ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
-    $proc = Start-Process -FilePath $GuiPath -ArgumentList $argLine -WindowStyle Hidden -PassThru
-    # The helper exits as soon as it has passed the command on.
-    [void]$proc.WaitForExit(10000)
+function Stop-Tor {
+    # Ends this project's Tor.
+    Get-TorProcesses | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
 }
 
-function Start-OpenVpnGui {
-    # Makes sure OpenVPN GUI is running (it has to be, for "--command" to work).
-    param([string]$GuiPath)
-    if (Get-OpenVpnGuiProcess) {
-        # Already running: hide its connection window and make it notice the copied configs.
-        Invoke-OpenVpnGui -GuiPath $GuiPath -Arguments '--command', 'silent_connection', '1'
-        Invoke-OpenVpnGui -GuiPath $GuiPath -Arguments '--command', 'rescan'
-        Start-Sleep -Seconds 1
-        return
-    }
-    # Start it quietly in the tray: no connection window, no pop-up on every switch.
-    Start-Process -FilePath $GuiPath -ArgumentList '--silent_connection 1 --show_balloon 0'
-    for ($i = 0; $i -lt 20 -and -not (Get-OpenVpnGuiProcess); $i++) { Start-Sleep -Milliseconds 500 }
-    if (-not (Get-OpenVpnGuiProcess)) { throw 'OpenVPN GUI did not start.' }
-    Start-Sleep -Seconds 3   # give it a moment to load its list of configs
-}
+function Start-Tor {
+    # Starts tor.exe hidden, with its own settings file (torrc).
+    # "__OwningControllerProcess" makes Tor quit by itself if the rotator ends.
+    param([int]$OwnerPid)
+    $exe = Get-TorExe
+    New-Item -ItemType Directory -Path $TOR_DATA_DIR -Force | Out-Null
 
-function Read-SharedText {
-    # Reads a file that OpenVPN may still be writing to. Returns '' if it can't.
-    param([string]$Path)
-    try {
-        $stream = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite, Delete')
-        try { return (New-Object IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Dispose() }
-    } catch { return '' }
-}
+    # In torrc, a value with a path goes in quotes with its backslashes doubled.
+    # The quotes must wrap the WHOLE value, or Tor keeps them as part of the name.
+    function Format-TorPath([string]$Path) { return '"' + $Path.Replace('\', '\\') + '"' }
 
-function Connect-Vpn {
-    # Asks OpenVPN GUI to connect one config, then watches OpenVPN's log file
-    # to see how it went. Returns 'ok', 'auth-failed', 'error' or 'timeout'.
-    param([string]$GuiPath, [string]$Name)
-    $log = Join-Path (Get-OpenVpnGuiFolders).LogDir "$Name.log"
-    # Delete the old log so we only look at this attempt.
-    Remove-Item -Path $log -Force -ErrorAction SilentlyContinue
-    $started = Get-Date
-    Invoke-OpenVpnGui -GuiPath $GuiPath -Arguments '--command', 'connect', $Name
-
-    $deadline = $started.AddSeconds($CONNECT_TIMEOUT_SECONDS)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 1
-        if (-not (Test-Path $log) -or (Get-Item $log).LastWriteTime -lt $started.AddSeconds(-2)) { continue }
-        $text = Read-SharedText $log
-        if ($text -match 'Initialization Sequence Completed') { return 'ok' }
-        if ($text -match 'AUTH_FAILED') { return 'auth-failed' }
-        if ($text -match 'Exiting due to fatal error') { return 'error' }
-    }
-    return 'timeout'
-}
-
-function Get-OpenVpnProcesses {
-    # The OpenVPN processes that belong to IP Rotator's configs (not your own ones).
-    $pattern = [regex]::Escape($CONFIG_NAME_PREFIX) + '[^"\\]+?\.ovpn'
-    return @(Get-CimInstance Win32_Process -Filter "Name = 'openvpn.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match $pattern })
-}
-
-function Get-ConnectedRotatorConfigs {
-    # Names of IP Rotator configs that currently have OpenVPN running.
-    $pattern = '(' + [regex]::Escape($CONFIG_NAME_PREFIX) + '[^"\\]+?)\.ovpn'
-    foreach ($proc in Get-OpenVpnProcesses) {
-        if ($proc.CommandLine -match $pattern) { $Matches[1] }
-    }
-}
-
-function Disconnect-Vpn {
-    # Asks OpenVPN GUI to disconnect one config and waits until OpenVPN has exited.
-    param([string]$GuiPath, [string]$Name)
-    Invoke-OpenVpnGui -GuiPath $GuiPath -Arguments '--command', 'disconnect', $Name
-    $deadline = (Get-Date).AddSeconds($DISCONNECT_TIMEOUT_SECONDS)
-    while ((Get-Date) -lt $deadline -and (@(Get-ConnectedRotatorConfigs) -contains $Name)) {
-        Start-Sleep -Milliseconds 500
-    }
-    Start-Sleep -Seconds 2   # let Windows restore your normal routes and DNS
-}
-
-function Disconnect-AllRotatorVpns {
-    # Disconnects every IP Rotator connection. Connections you made yourself
-    # with other configs are left alone. If OpenVPN GUI doesn't respond, the
-    # OpenVPN processes are ended directly as a last resort.
-    param([string]$GuiPath)
-    if ($GuiPath -and (Get-OpenVpnGuiProcess)) {
-        foreach ($name in @(Get-ConnectedRotatorConfigs | Select-Object -Unique)) {
-            Disconnect-Vpn -GuiPath $GuiPath -Name $name
+    $torLog = Join-Path $TOR_DATA_DIR 'tor.log'
+    $lines = @(
+        "DataDirectory $(Format-TorPath $TOR_DATA_DIR)",
+        "HTTPTunnelPort 127.0.0.1:$TOR_HTTP_PORT",
+        "SocksPort 127.0.0.1:$TOR_SOCKS_PORT",
+        "ControlPort 127.0.0.1:$TOR_CONTROL_PORT",
+        'CookieAuthentication 1',
+        "Log $(Format-TorPath "notice file $torLog")",
+        "__OwningControllerProcess $OwnerPid"
+    )
+    # Country look-up files that come with Tor (used to show the exit country).
+    foreach ($name in 'geoip', 'geoip6') {
+        $file = Get-ChildItem -Path $TOR_DIR -Recurse -File -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($file) {
+            $option = if ($name -eq 'geoip') { 'GeoIPFile' } else { 'GeoIPv6File' }
+            $lines += "$option $(Format-TorPath $file.FullName)"
         }
     }
-    $leftovers = Get-OpenVpnProcesses
-    if ($leftovers.Count -gt 0) {
-        $leftovers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Start-Sleep -Seconds 2
+    $torrc = Join-Path $TOR_DATA_DIR 'torrc'
+    [IO.File]::WriteAllText($torrc, ($lines -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding $false))
+    Remove-Item -Path $torLog -Force -ErrorAction SilentlyContinue
+
+    return Start-Process -FilePath $exe -ArgumentList ('-f "{0}"' -f $torrc) `
+        -WorkingDirectory (Split-Path $exe) -WindowStyle Hidden -PassThru
+}
+
+function Read-TorReply {
+    # Reads one complete reply from Tor's control port.
+    param([IO.StreamReader]$Reader)
+    $lines = @()
+    while ($true) {
+        $line = $Reader.ReadLine()
+        if ($null -eq $line) { throw 'Tor closed the control connection.' }
+        $lines += $line
+        if ($line -match '^\d{3}\+') {
+            # A multi-line block; it ends with a line holding just "."
+            while ($true) {
+                $data = $Reader.ReadLine()
+                if ($null -eq $data -or $data -eq '.') { break }
+                $lines += $data
+            }
+        }
+        elseif ($line -match '^\d{3} ') { return , $lines }
     }
+}
+
+function Invoke-TorControl {
+    # Talks to Tor's control port: logs in with the cookie file Tor wrote,
+    # sends each command and returns all reply lines.
+    param([string[]]$Commands)
+    $cookieBytes = [IO.File]::ReadAllBytes((Join-Path $TOR_DATA_DIR 'control_auth_cookie'))
+    $cookie = ($cookieBytes | ForEach-Object { $_.ToString('x2') }) -join ''
+
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $client.Connect('127.0.0.1', $TOR_CONTROL_PORT)
+        $client.ReceiveTimeout = 15000
+        $stream = $client.GetStream()
+        $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::ASCII)
+        $writer = New-Object IO.StreamWriter($stream, [Text.Encoding]::ASCII)
+        $writer.NewLine = "`r`n"
+        $writer.AutoFlush = $true
+
+        $writer.WriteLine("AUTHENTICATE $cookie")
+        $auth = Read-TorReply $reader
+        if ($auth[-1] -notmatch '^250 ') { throw "Tor refused the control login: $($auth[-1])" }
+
+        $all = @()
+        foreach ($command in $Commands) {
+            $writer.WriteLine($command)
+            $all += Read-TorReply $reader
+        }
+        $writer.WriteLine('QUIT')
+        return $all
+    }
+    finally { $client.Close() }
+}
+
+function Wait-TorReady {
+    # Waits until Tor has finished connecting to the Tor network.
+    # Returns $true when ready, $false if it took too long.
+    param([System.Diagnostics.Process]$TorProcess, [int]$TimeoutSeconds)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ($TorProcess.HasExited) { throw "Tor stopped while starting. Details: $(Join-Path $TOR_DATA_DIR 'tor.log')" }
+        try {
+            $reply = Invoke-TorControl 'GETINFO status/bootstrap-phase'
+            if ((($reply -join ' ') -match 'PROGRESS=(\d+)') -and [int]$Matches[1] -ge 100) { return $true }
+        } catch { }   # Tor's control port isn't open yet
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Request-NewTorIdentity {
+    # Asks Tor for brand-new routes (a new exit = a new public IP), then closes
+    # the old routes so browsers can't keep using the old IP over a connection
+    # that is still open. Web traffic uses routes labelled GENERAL or, in newer
+    # Tor versions, CONFLUX_LINKED / CONFLUX_UNLINKED.
+    $reply = Invoke-TorControl 'SIGNAL NEWNYM', 'GETINFO circuit-status'
+    $ids = @($reply | Where-Object { $_ -match '^\d+ BUILT ' -and $_ -match 'PURPOSE=(GENERAL|CONFLUX_LINKED|CONFLUX_UNLINKED)\b' } |
+        ForEach-Object { ($_ -split ' ')[0] })
+    if ($ids.Count -gt 0) { [void](Invoke-TorControl ($ids | ForEach-Object { "CLOSECIRCUIT $_" })) }
+}
+
+function Get-TorCountry {
+    # The country an IP belongs to, using the look-up files that come with Tor.
+    param([string]$Ip)
+    try {
+        $reply = Invoke-TorControl "GETINFO ip-to-country/$Ip"
+        if (($reply -join "`n") -match 'ip-to-country/[^=]+=([a-zA-Z]{2})') {
+            $code = $Matches[1]
+            try { return (New-Object Globalization.RegionInfo $code).EnglishName } catch { return $code.ToUpper() }
+        }
+    } catch { }
+    return 'unknown country'
+}
+
+
+# -----------------------------------------------------------------------------
+#  Windows proxy settings
+# -----------------------------------------------------------------------------
+
+function Update-WindowsProxy {
+    # Tells Windows and running apps (like your browser) that the proxy changed.
+    if (-not ('IPRotator.WinInet' -as [type])) {
+        Add-Type -Namespace IPRotator -Name WinInet -MemberDefinition @'
+[DllImport("wininet.dll", SetLastError = true)]
+public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+'@
+    }
+    [void][IPRotator.WinInet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)   # settings changed
+    [void][IPRotator.WinInet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)   # refresh
+}
+
+function Register-ProxyCleanup {
+    # Safety net: if the PC restarts or you sign out while the rotator is running,
+    # put your normal proxy settings back the next time you sign in. Windows runs
+    # a "RunOnce" entry one time and then deletes it. It does NOT start the rotator.
+    $command = '"{0}" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -Quiet' -f `
+        (Join-Path $PSHOME 'powershell.exe'), (Join-Path $ROOT_DIR 'stop.ps1')
+    if (-not (Test-Path $RUNONCE_KEY)) { New-Item -Path $RUNONCE_KEY | Out-Null }
+    Set-ItemProperty -Path $RUNONCE_KEY -Name $RUNONCE_NAME -Value $command
+}
+
+function Unregister-ProxyCleanup {
+    Remove-ItemProperty -Path $RUNONCE_KEY -Name $RUNONCE_NAME -ErrorAction SilentlyContinue
+}
+
+function Set-TorProxy {
+    # Saves your current proxy settings (only once), then points Windows at Tor:
+    # HTTPS sites go through Tor's HTTP tunnel, everything else through Tor's SOCKS port.
+    if (-not (Test-Path $PROXY_BACKUP_PATH)) {
+        $current = Get-ItemProperty -Path $INTERNET_SETTINGS_KEY
+        $backup = [ordered]@{}
+        foreach ($name in $PROXY_VALUE_NAMES) { $backup[$name] = $current.$name }
+        Write-JsonFile -Path $PROXY_BACKUP_PATH -Data $backup
+    }
+    Register-ProxyCleanup
+    Set-ItemProperty -Path $INTERNET_SETTINGS_KEY -Name 'ProxyEnable'   -Value 1 -Type DWord
+    Set-ItemProperty -Path $INTERNET_SETTINGS_KEY -Name 'ProxyServer'   -Value "https=127.0.0.1:$TOR_HTTP_PORT;socks=127.0.0.1:$TOR_SOCKS_PORT" -Type String
+    Set-ItemProperty -Path $INTERNET_SETTINGS_KEY -Name 'ProxyOverride' -Value $PROXY_BYPASS -Type String
+    # A proxy "setup script" would take priority over the settings above.
+    Remove-ItemProperty -Path $INTERNET_SETTINGS_KEY -Name 'AutoConfigURL' -ErrorAction SilentlyContinue
+    Update-WindowsProxy
+}
+
+function Restore-ProxySettings {
+    # Puts your original proxy settings back. Safe to call at any time.
+    # Returns $true if something was restored.
+    $backup = Read-JsonFile $PROXY_BACKUP_PATH
+    if (-not $backup) { Unregister-ProxyCleanup; return $false }
+    foreach ($name in $PROXY_VALUE_NAMES) {
+        $value = $backup.$name
+        if ($null -eq $value) {
+            Remove-ItemProperty -Path $INTERNET_SETTINGS_KEY -Name $name -ErrorAction SilentlyContinue
+        } elseif ($name -eq 'ProxyEnable') {
+            Set-ItemProperty -Path $INTERNET_SETTINGS_KEY -Name $name -Value ([int]$value) -Type DWord
+        } else {
+            Set-ItemProperty -Path $INTERNET_SETTINGS_KEY -Name $name -Value ([string]$value) -Type String
+        }
+    }
+    Remove-Item -Path $PROXY_BACKUP_PATH -Force
+    Update-WindowsProxy
+    Unregister-ProxyCleanup
+    return $true
 }
 
 
@@ -280,10 +365,21 @@ function Disconnect-AllRotatorVpns {
 
 function Get-PublicIp {
     # Asks api.ipify.org for your public IP. Returns $null if it can't be reached.
-    param([int]$Tries = 3)
+    #   -Via System = through Windows' proxy settings (what your browser sees)
+    #   -Via Tor    = straight through Tor
+    #   -Via Direct = no proxy at all (your normal IP)
+    param([ValidateSet('System', 'Tor', 'Direct')][string]$Via = 'System', [int]$Tries = 3)
     for ($i = 1; $i -le $Tries; $i++) {
         try {
-            $ip = "$(Invoke-RestMethod -Uri $IP_CHECK_URL -TimeoutSec 10 -UseBasicParsing)".Trim()
+            $request = [Net.HttpWebRequest]::Create($IP_CHECK_URL)
+            $request.Timeout = 20000
+            $request.KeepAlive = $false   # a fresh connection, so a new IP shows up right away
+            if ($Via -eq 'Tor')        { $request.Proxy = New-Object Net.WebProxy("http://127.0.0.1:$TOR_HTTP_PORT") }
+            elseif ($Via -eq 'Direct') { $request.Proxy = $null }
+            else                       { $request.Proxy = [Net.WebRequest]::GetSystemWebProxy() }
+            $response = $request.GetResponse()
+            try { $ip = (New-Object IO.StreamReader($response.GetResponseStream())).ReadToEnd().Trim() }
+            finally { $response.Close() }
             if ($ip -match '^[0-9a-fA-F:.]+$') { return $ip }
         } catch { }
         if ($i -lt $Tries) { Start-Sleep -Seconds 2 }
@@ -293,24 +389,8 @@ function Get-PublicIp {
 
 
 # -----------------------------------------------------------------------------
-#  Setup checks and console helpers
+#  Console helpers
 # -----------------------------------------------------------------------------
-
-function Get-SetupProblems {
-    # Returns a plain-English list of anything that stops the rotator from working.
-    $problems = @()
-    if (-not (Find-OpenVpnGui)) {
-        $problems += 'OpenVPN GUI is not installed. Get it from https://openvpn.net/community-downloads/ and then run setup.bat.'
-    }
-    if (-not (Test-Path $AUTH_FILE_PATH)) {
-        $problems += 'Your Proton OpenVPN username/password has not been saved yet. Run setup.bat.'
-    }
-    $udpCount = @((Get-SourceConfigs).Udp).Count
-    if ($udpCount -lt 2) {
-        $problems += "Put at least 2 Proton free-server UDP .ovpn files in the configs folder (found $udpCount): $CONFIGS_DIR"
-    }
-    return $problems
-}
 
 function Write-Title {
     param([string]$Text)

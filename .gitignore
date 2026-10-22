@@ -1,18 +1,9 @@
 # ---------------------------------------------------------------------------
-#  Never publish these
+#  Downloaded automatically on first run (never commit these)
 # ---------------------------------------------------------------------------
-
-# Proton VPN server configs: everyone downloads their own (see configs/README.md)
-configs/*.ovpn
-*.ovpn
-
-# Credentials / auth files. setup.bat stores yours outside this folder
-# (%USERPROFILE%\.iprotator\), but block them here too, just in case.
-.iprotator/
-proton-auth.txt
-*auth*.txt
-*.credentials
-*.secret
+tor/
+tor-data/
+*.tar.gz
 
 # ---------------------------------------------------------------------------
 #  Runtime files created while the rotator runs
@@ -21,10 +12,20 @@ rotator.log
 rotator.log.*
 settings.json
 state.json
+proxy-backup.json
 *.tmp
 rotator.pid
 *.pid
 *.lock
+
+# ---------------------------------------------------------------------------
+#  Never publish secrets (IP Rotator itself doesn't use any)
+# ---------------------------------------------------------------------------
+*.ovpn
+*auth*.txt
+*.credentials
+*.secret
+.env
 
 # ---------------------------------------------------------------------------
 #  Windows and editor clutter

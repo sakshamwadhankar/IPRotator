@@ -1,14 +1,44 @@
 <#
 =============================================================================
  start.ps1 - asks how often to change your IP, then starts rotator.ps1 as a
- hidden background process and returns. Run it by double-clicking start.bat.
+ hidden background process. Run it by double-clicking start.bat, or from a
+ terminal without any questions:
+     start.bat 300        change IP every 300 seconds until stop.bat
+     start.bat 300 2      ... and stop by itself after 2 hours
 
+ The first time, it downloads Tor (about 20 MB) automatically.
  Because the rotator runs as its own hidden process, pressing Ctrl+C or
  closing this window afterwards does NOT stop it. Use stop.bat for that.
 =============================================================================
 #>
+param(
+    [string]$Interval,        # optional: seconds, given on the command line
+    [string]$AutoStopHours    # optional: hours, given on the command line
+)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
+
+function Test-IntervalText {
+    # Returns an explanation if the interval isn't acceptable, or '' if it's fine.
+    param([string]$Text)
+    if ($Text -notmatch '^\d+$') { return 'Please type a whole number of seconds, for example 120 or 3600.' }
+    $number = 0
+    if (-not [int]::TryParse($Text, [ref]$number)) { return 'That number is too big. Try something like 3600 (1 hour) or 86400 (1 day).' }
+    if ($number -lt $MIN_INTERVAL_SECONDS) {
+        return "The minimum is $MIN_INTERVAL_SECONDS seconds: asking Tor for a new IP more often puts extra load on the volunteer-run Tor network."
+    }
+    return ''
+}
+
+function Test-HoursText {
+    # Returns the number of hours, or -1 if the text isn't a valid number of hours.
+    param([string]$Text)
+    $hours = 0.0
+    $ok = [double]::TryParse($Text, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$hours)
+    if ($ok -and $hours -gt 0 -and $hours -le 8760) { return $hours }
+    return -1
+}
 
 try {
     Write-Title 'IP Rotator - start'
@@ -21,65 +51,63 @@ try {
         exit 1
     }
 
-    # --- Make sure setup is done ---------------------------------------------
-    $problems = @(Get-SetupProblems)
-    if ($problems.Count -gt 0) {
-        Write-Host "  IP Rotator can't start yet:" -ForegroundColor Yellow
-        foreach ($p in $problems) { Write-Host "   - $p" -ForegroundColor Yellow }
-        exit 1
-    }
+    # If the last run didn't stop cleanly (e.g. the PC was switched off),
+    # quietly put your normal proxy settings back first.
+    if (Test-Path $PROXY_BACKUP_PATH) { [void](Restore-ProxySettings) }
+    Stop-Tor
 
-    # --- Question 1: the interval --------------------------------------------
-    # The last interval you used is offered as the default (just press Enter).
-    $settings = Read-JsonFile $SETTINGS_PATH
-    $lastInterval = 0
-    if ($settings -and "$($settings.lastIntervalSeconds)" -match '^\d+$') { $lastInterval = [int]$settings.lastIntervalSeconds }
-    if ($lastInterval -lt $MIN_INTERVAL_SECONDS) { $lastInterval = 0 }
+    # --- Interval and auto-stop ----------------------------------------------
+    if ($Interval) {
+        # Given on the command line: no questions.
+        $problem = Test-IntervalText $Interval
+        if ($problem) { Write-Host "  $problem" -ForegroundColor Yellow; exit 1 }
+        $seconds = [int]$Interval
+        $hours = 0
+        if ($AutoStopHours) {
+            $hours = Test-HoursText $AutoStopHours
+            if ($hours -lt 0) { Write-Host '  Auto-stop hours must be a number above 0, for example 2 or 1.5.' -ForegroundColor Yellow; exit 1 }
+        }
+    } else {
+        # Ask. The last interval you used is offered as the default (just press Enter).
+        $settings = Read-JsonFile $SETTINGS_PATH
+        $lastInterval = 0
+        if ($settings -and "$($settings.lastIntervalSeconds)" -match '^\d+$') { $lastInterval = [int]$settings.lastIntervalSeconds }
+        if ($lastInterval -lt $MIN_INTERVAL_SECONDS) { $lastInterval = 0 }
 
-    $interval = 0
-    while ($interval -eq 0) {
-        $question = 'Change IP every how many seconds?'
-        if ($lastInterval) { $question += " [press Enter for $lastInterval]" }
-        $answer = Read-Answer $question
-        if (-not $answer -and $lastInterval) { $answer = "$lastInterval" }
+        $seconds = 0
+        while ($seconds -eq 0) {
+            $question = 'Change IP every how many seconds?'
+            if ($lastInterval) { $question += " [press Enter for $lastInterval]" }
+            $answer = Read-Answer $question
+            if (-not $answer -and $lastInterval) { $answer = "$lastInterval" }
+            $problem = Test-IntervalText $answer
+            if ($problem) { Write-Host "  $problem" -ForegroundColor Yellow; continue }
+            if (Read-YesNo ('{0} seconds = {1}. Start? (Y/N)' -f $answer, (Format-Duration ([int]$answer)))) {
+                $seconds = [int]$answer
+            } else {
+                Write-Host '  OK, enter a different interval (or close this window to cancel).'
+            }
+        }
 
-        # Whole numbers only.
-        $number = 0
-        if ($answer -notmatch '^\d+$') {
-            Write-Host '  Please type a whole number of seconds, for example 120 or 3600.' -ForegroundColor Yellow
-            continue
+        $hours = -1
+        while ($hours -lt 0) {
+            $answer = Read-Answer 'Auto-stop after how many hours? (press Enter = run until I stop it)'
+            if (-not $answer) { $hours = 0; break }
+            $hours = Test-HoursText $answer
+            if ($hours -lt 0) { Write-Host '  Please type a number of hours above 0 (for example 2 or 1.5), or just press Enter.' -ForegroundColor Yellow }
         }
-        if (-not [int]::TryParse($answer, [ref]$number)) {
-            Write-Host '  That number is too big. Try something like 3600 (1 hour) or 86400 (1 day).' -ForegroundColor Yellow
-            continue
-        }
-        # Enforce the minimum, and explain why.
-        if ($number -lt $MIN_INTERVAL_SECONDS) {
-            Write-Host "  The minimum is $MIN_INTERVAL_SECONDS seconds. Each switch takes 10-30 seconds to reconnect," -ForegroundColor Yellow
-            Write-Host '  and reconnecting very often can get a free Proton account throttled.' -ForegroundColor Yellow
-            continue
-        }
-        # Echo it back in readable form and confirm.
-        if (Read-YesNo ('{0} seconds = {1}. Start? (Y/N)' -f $number, (Format-Duration $number))) {
-            $interval = $number
-        } else {
-            Write-Host '  OK, enter a different interval (or close this window to cancel).'
-        }
-    }
-
-    # --- Question 2: auto-stop -----------------------------------------------
-    $autoStopHours = -1
-    while ($autoStopHours -lt 0) {
-        $answer = Read-Answer 'Auto-stop after how many hours? (press Enter = run until I stop it)'
-        if (-not $answer) { $autoStopHours = 0; break }
-        $hours = 0.0
-        $isNumber = [double]::TryParse($answer, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$hours)
-        if ($isNumber -and $hours -gt 0 -and $hours -le 8760) { $autoStopHours = $hours }
-        else { Write-Host '  Please type a number of hours above 0 (for example 2 or 1.5), or just press Enter.' -ForegroundColor Yellow }
     }
 
     # Remember the interval for next time.
-    Write-JsonFile -Path $SETTINGS_PATH -Data ([ordered]@{ lastIntervalSeconds = $interval })
+    Write-JsonFile -Path $SETTINGS_PATH -Data ([ordered]@{ lastIntervalSeconds = $seconds })
+
+    # --- Tor: downloaded automatically the first time ------------------------
+    if (-not (Get-TorExe)) {
+        Write-Host ''
+        Write-Host '  First run: downloading Tor (about 20 MB) from torproject.org...'
+        $version = Install-Tor
+        Write-Host "  [OK] Tor $version downloaded and checked." -ForegroundColor Green
+    }
 
     # --- Launch the rotator hidden -------------------------------------------
     # A separate, hidden PowerShell process: it has no link to this window, so
@@ -87,21 +115,23 @@ try {
     # applies to that one process only; your system setting is never changed.
     $rotatorPath = Join-Path $PSScriptRoot 'rotator.ps1'
     $powershell  = Join-Path $PSHOME 'powershell.exe'
-    $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -IntervalSeconds {1}' -f $rotatorPath, $interval
-    if ($autoStopHours -gt 0) {
-        $argLine += ' -AutoStopHours ' + $autoStopHours.ToString([Globalization.CultureInfo]::InvariantCulture)
-    }
+    $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -IntervalSeconds {1}' -f $rotatorPath, $seconds
+    if ($hours -gt 0) { $argLine += ' -AutoStopHours ' + ([double]$hours).ToString([Globalization.CultureInfo]::InvariantCulture) }
     $proc = Start-Process -FilePath $powershell -ArgumentList $argLine -WindowStyle Hidden -PassThru
 
-    # Wait until the rotator has written its lock file, then a few seconds more:
-    # setup problems make it quit almost immediately, and we want to report that.
-    $deadline = (Get-Date).AddSeconds(15)
+    # Show progress until the first new IP is in place (usually 10-40 seconds).
+    Write-Host ''
+    Write-Host '  Connecting to Tor' -NoNewline
+    $state = $null
+    $deadline = (Get-Date).AddSeconds($TOR_START_TIMEOUT_SECONDS + 60)
     while ((Get-Date) -lt $deadline -and -not $proc.HasExited) {
-        $lockPid = Get-Content -Path $PID_PATH -Raw -ErrorAction SilentlyContinue
-        if ($lockPid -and $lockPid.Trim() -eq "$($proc.Id)") { break }
-        Start-Sleep -Milliseconds 300
+        $state = Read-JsonFile $STATE_PATH
+        if ($state -and $state.pid -eq $proc.Id -and $state.lastRotation) { break }
+        Write-Host '.' -NoNewline
+        Start-Sleep -Seconds 2
     }
-    for ($i = 0; $i -lt 10 -and -not $proc.HasExited; $i++) { Start-Sleep -Milliseconds 300 }
+    Write-Host ''
+
     if ($proc.HasExited) {
         Write-Host ''
         Write-Host '  The rotator stopped right after starting. Last lines of rotator.log:' -ForegroundColor Red
@@ -110,12 +140,16 @@ try {
     }
 
     Write-Host ''
-    Write-Host "  Running in background, changing IP every $interval seconds. Use stop.bat to stop." -ForegroundColor Green
-    if ($autoStopHours -gt 0) {
-        Write-Host ("  It will stop by itself after {0} h (at {1})." -f $autoStopHours, (Get-Date).AddHours($autoStopHours).ToString('HH:mm, ddd d MMM'))
+    if ($state -and $state.lastRotation) {
+        Write-Host "  Your IP is now $($state.currentIp) ($($state.country)). Your normal IP is $($state.homeIp)." -ForegroundColor Green
+    } else {
+        Write-Host '  Still connecting in the background; status.bat shows when the first new IP is ready.' -ForegroundColor Yellow
     }
-    Write-Host '  The first switch is happening now and takes about 10-30 seconds.'
-    Write-Host '  status.bat shows what it is doing. You can close this window.'
+    Write-Host "  Running in background, changing IP every $seconds seconds. Use stop.bat to stop." -ForegroundColor Green
+    if ($hours -gt 0) {
+        Write-Host ("  It will stop by itself after {0} h (at {1})." -f $hours, (Get-Date).AddHours($hours).ToString('HH:mm, ddd d MMM'))
+    }
+    Write-Host '  You can close this window.'
     exit 0
 }
 catch {

@@ -7,8 +7,7 @@ assignees: ''
 ---
 
 <!--
-Before posting: remove your OpenVPN username/password, your home IP address
-and anything from your .ovpn files. Never paste your proton-auth.txt file.
+Before posting: remove your real (home) IP address from everything you paste.
 -->
 
 **What happened?**
@@ -22,16 +21,20 @@ A clear description of the problem.
 
 **Output of `status.bat`**
 ```
-paste here (remove your IP addresses)
+paste here (remove your home IP)
 ```
 
 **Last 20 lines of `rotator.log`**
 ```
-paste here (remove your IP addresses)
+paste here (remove your home IP)
+```
+
+**Last 20 lines of `tor-data\tor.log`** (if Tor didn't connect)
+```
+paste here
 ```
 
 **Your setup**
-- Windows version (e.g. Windows 11 23H2):
-- OpenVPN version (OpenVPN GUI → right-click tray icon → About):
-- Number of `.ovpn` files in `configs\`:
-- Is the official Proton VPN app also installed? yes / no
+- Windows version (e.g. Windows 11 24H2):
+- Browser and version:
+- Any VPN, proxy or antivirus web filter in use? yes / no

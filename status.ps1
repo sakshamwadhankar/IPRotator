@@ -1,7 +1,7 @@
 <#
 =============================================================================
  status.ps1 - shows whether the rotator is running, the interval in use, your
- current public IP, the server in use, the time until the next switch and the
+ current public IP and its country, the time until the next change and the
  last 10 log lines. Run it by double-clicking status.bat.
 =============================================================================
 #>
@@ -24,6 +24,9 @@ try {
         Show-Row 'Running' "YES (process $($proc.ProcessId))" 'Green'
     } else {
         Show-Row 'Running' 'NO (start it with start.bat)' 'Yellow'
+        if (Test-Path $PROXY_BACKUP_PATH) {
+            Show-Row 'Note' 'Windows is still set to use Tor. Run stop.bat to fix your internet.' 'Red'
+        }
     }
 
     if ($proc -and $state) {
@@ -38,28 +41,27 @@ try {
             Show-Row 'Auto-stop' 'off (runs until you use stop.bat)'
         }
 
-        if ($state.currentServer) { Show-Row 'Server in use' $state.currentServer 'Green' }
-        else { Show-Row 'Server in use' 'none (normal internet)' 'Yellow' }
+        if ($state.country) { Show-Row 'Tor exit country' $state.country 'Green' }
 
         $next = ConvertTo-DateTime $state.nextRotation
-        if ($state.status -eq 'switching') {
-            Show-Row 'Next switch' "switching right now... $($state.message)" 'Cyan'
+        if ($state.status -eq 'connecting') {
+            Show-Row 'Next change' 'connecting to Tor...' 'Cyan'
+        } elseif ($state.status -eq 'changing') {
+            Show-Row 'Next change' 'changing right now...' 'Cyan'
         } elseif ($next) {
-            Show-Row 'Next switch' ('in {0} (at {1})' -f (Format-Duration ($next - (Get-Date)).TotalSeconds), $next.ToString('HH:mm:ss'))
-        } else {
-            Show-Row 'Next switch' 'starting up...'
+            Show-Row 'Next change' ('in {0} (at {1})' -f (Format-Duration ($next - (Get-Date)).TotalSeconds), $next.ToString('HH:mm:ss'))
         }
-        if ($state.status -eq 'not connected' -and $state.message) { Show-Row 'Note' $state.message 'Yellow' }
+        if ($state.message) { Show-Row 'Note' $state.message 'Yellow' }
     }
 
-    # Ask ipify for your IP right now.
-    $ip = Get-PublicIp
+    # What websites see right now (through Windows' proxy settings, like your browser).
+    $ip = Get-PublicIp -Via System
     if (-not $ip) {
         Show-Row 'Current public IP' "can't reach the internet right now" 'Red'
     } else {
         $label = $ip
         if ($state -and $state.homeIp -and $ip -eq $state.homeIp) { $label += '  (your normal IP)' }
-        elseif ($proc -and $state -and $state.currentServer) { $label += '  (via VPN)' }
+        elseif ($proc) { $label += '  (via Tor)' }
         Show-Row 'Current public IP' $label 'Green'
     }
 
