@@ -447,4 +447,4 @@ addresses and credentials from anything you paste.
 
 ## License
 
-[MIT](LICENSE) © 2026 Padmaja Thakre
+[MIT](LICENSE) © 2026 Saksham Wadhankar
